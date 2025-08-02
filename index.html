@@ -1,0 +1,554 @@
+<!--
+MIT License
+
+Copyright (c) 2025 Vlad Matsko
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=0">
+        <title>CFD &ndash; Navier-Stokes</title>
+        <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+
+            html,
+            body {
+                height: 100%;
+            }
+
+            body {
+                display: flex;
+            }
+
+            canvas {
+                width: 1024px;
+                height: 512px;
+                margin: auto;
+                image-rendering: pixelated;
+                touch-action: none;
+            }
+        </style>
+    </head>
+
+    <body>
+        <canvas width="256" height="128"></canvas>
+
+        <script>
+            class Field extends Float32Array {
+                constructor(width, height) {
+                    super(width * height);
+
+                    this.width = width;
+                    this.height = height;
+                }
+
+                get(x, y) {
+                    const index = x + y * this.width;
+
+                    return this[index];
+                }
+
+                set(x, y, value) {
+                    const index = x + y * this.width;
+
+                    this[index] = value;
+                }
+            }
+        </script>
+
+        <script type="module">
+            import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
+
+            const canvasElement = document.querySelector('canvas');
+            const canvasWidth = canvasElement.width;
+            const canvasHeight = canvasElement.height;
+            const canvasArea = canvasWidth * canvasHeight;
+            const canvasContext = canvasElement.getContext('2d', { alpha: false });
+            const canvasImageData = canvasContext.createImageData(canvasWidth, canvasHeight);
+            const canvasImageDataView = new Uint32Array(canvasImageData.data.buffer);
+
+            const params = {
+                // Simulation
+                dx: 1,
+                dt: .25,
+                re: 100, // Reynolds number
+                vorticity: .25,
+                omega: 1.7, // Relaxation factor
+                diffusionIterations: 8,
+                pressureIterations: 8,
+                // Visual
+                canvasResolution: 4,
+                pixelated: true,
+                pressureBlending: .0625,
+                splatRadius: 8,
+                dyeFade: .995,
+            };
+
+            const gui = new Pane();
+            const guiSimulationFolder = gui.addFolder({ title: 'Simulation' });
+            const guiVisualFolder = gui.addFolder({ title: 'Visual' });
+
+            guiSimulationFolder.addBinding(params, 're', { label: 'Reynolds Number', min: .25, max: 200, step: .01 });
+            guiSimulationFolder.addBinding(params, 'vorticity', { label: 'Vorticity', min: 0, max: .5, step: .01 });
+            guiSimulationFolder.addBinding(params, 'omega', { label: 'Relaxation Factor', min: 1, max: 1.99, step: .01 });
+            guiSimulationFolder.addBinding(params, 'diffusionIterations', { label: 'Diffusion Iterations', min: 2, max: 32, step: 2 });
+            guiSimulationFolder.addBinding(params, 'pressureIterations', { label: 'Pressure Iterations', min: 2, max: 32, step: 2 });
+
+            guiVisualFolder.addBinding(params, 'pixelated', { label: 'Pixelated' });
+            guiVisualFolder.addBinding(params, 'pressureBlending', { label: 'Pressure Blending', min: 0, max: .5, step: .01 });
+            guiVisualFolder.addBinding(params, 'splatRadius', { label: 'Splat Radius', min: 2, max: 32, step: 2 });
+            guiVisualFolder.addBinding(params, 'dyeFade', { label: 'Dye Fade', min: .9, max: 1, step: .001 });
+
+            gui.on('change', (event) => {
+                if (event.target.key !== 'pixelated') {
+                    return;
+                }
+
+                canvasElement.style.imageRendering = event.value ? 'pixelated' : 'initial';
+            });
+
+            let u0 = new Field(canvasWidth + 1, canvasHeight);
+            let u1 = new Field(canvasWidth + 1, canvasHeight);
+            let v0 = new Field(canvasWidth, canvasHeight + 1);
+            let v1 = new Field(canvasWidth, canvasHeight + 1);
+            let p = new Field(canvasWidth, canvasHeight);
+            let div = new Field(canvasWidth, canvasHeight);
+            let vor = new Field(canvasWidth, canvasHeight);
+            let dye0 = new Field(canvasWidth, canvasHeight);
+            let dye1 = new Field(canvasWidth, canvasHeight);
+
+            canvasElement.addEventListener('pointermove', (event) => {
+                const {
+                    buttons,
+                    pressure,
+                    movementX,
+                    movementY,
+                    offsetX,
+                    offsetY,
+                } = event;
+
+                if (pressure + buttons <= 0) {
+                    return;
+                }
+
+                const { dt, canvasResolution, splatRadius } = params;
+
+                const pointerX = Math.floor(offsetX / canvasResolution);
+                const pointerY = Math.floor(offsetY / canvasResolution);
+
+                const movementLength = Math.max(1e-8, hypot(movementX, movementY));
+                const normalizedMovementX = movementX / movementLength;
+                const normalizedMovementY = movementY / movementLength;
+
+                for (let y = -splatRadius; y <= splatRadius; y++) {
+                    for (let x = -splatRadius; x <= splatRadius; x++) {
+                        const splatX = x + pointerX;
+                        const splatY = y + pointerY;
+                        const splatDistance = hypot(x, y);
+
+                        if (splatDistance > splatRadius || isExterior(splatX, splatY)) {
+                            continue;
+                        }
+
+                        const splatFade = 1 - splatDistance / splatRadius;
+
+                        const previousU = u0.get(splatX, splatY);
+                        const previousV = v0.get(splatX, splatY);
+                        const previousDye = dye0.get(splatX, splatY);
+
+                        const newU = previousU + splatFade * normalizedMovementX;
+                        const newV = previousV + splatFade * normalizedMovementY;
+                        const newDye = previousDye + .25 * splatFade;
+
+                        u0.set(splatX, splatY, newU);
+                        v0.set(splatX, splatY, newV);
+                        dye0.set(splatX, splatY, newDye);
+                    }
+                }
+            });
+
+            requestAnimationFrame(loop);
+
+            function int(value) {
+                return value | 0;
+            }
+
+            function fract(value) {
+                return value % 1;
+            }
+
+            function hypot(x, y) {
+                return Math.sqrt(x * x + y * y);
+            }
+
+            function clamp(value, min, max) {
+                return Math.max(min, Math.min(value, max));
+            }
+
+            function lerp(a, b, t) {
+                return (1 - t) * a + t * b;
+            }
+
+            function isInterior(x, y, padding = 1) {
+                return x >= padding
+                    && x <= canvasWidth - padding - 1
+                    && y >= padding
+                    && y <= canvasHeight - padding - 1
+            }
+
+            function isExterior(x, y, padding = 1) {
+                return !isInterior(x, y);
+            }
+
+            function advect(u, v, q0, q1) {
+                const qWidth = q0.width;
+                const qHeight = q0.height;
+
+                const dx = params.dx;
+                const dt = params.dt;
+
+                for (let y = 1; y < qHeight - 1; y++) {
+                    for (let x = 1; x < qWidth - 1; x++) {
+                        const uL = u.get(x, y);
+                        const uR = u.get(x + 1, y);
+                        const vT = v.get(x, y);
+                        const vB = v.get(x, y + 1);
+
+                        const uAvg = (uL + uR) / 2;
+                        const vAvg = (vT + vB) / 2;
+
+                        const tracedU = clamp(x - dt * uAvg, 1, qWidth - 1);
+                        const tracedV = clamp(y - dt * vAvg, 1, qHeight - 1);
+
+                        const intU = int(tracedU);
+                        const intV = int(tracedV);
+
+                        const fractU = fract(tracedU);
+                        const fractV = fract(tracedV);
+
+                        const qTL = q0.get(intU, intV);
+                        const qTR = q0.get(intU + 1, intV);
+                        const qBL = q0.get(intU, intV + 1);
+                        const qBR = q0.get(intU + 1, intV + 1);
+
+                        const qT = lerp(qTL, qTR, fractU);
+                        const qB = lerp(qBL, qBR, fractU);
+
+                        q1.set(x, y, lerp(qT, qB, fractV));
+                    }
+                }
+            }
+
+            function diffuse(q) {
+                const qWidth = q.width;
+                const qHeight = q.height;
+
+                const dx = params.dx;
+                const dt = params.dt;
+                const re = params.re;
+                const omega = params.omega;
+
+                const alpha = dt / (dx * dx * re);
+                const beta = 1 / (1 + 4 * alpha);
+
+                for (let y = 1; y < qHeight - 1; y++) {
+                    for (let x = 1; x < qWidth - 1; x++) {
+                        const qL = q.get(x - 1, y);
+                        const qR = q.get(x + 1, y);
+                        const qT = q.get(x, y - 1);
+                        const qB = q.get(x, y + 1);
+
+                        const q0 = q.get(x, y);
+                        const q1 = beta * (q0 + alpha * (qL + qR + qT + qB));
+
+                        q.set(x, y, (1 - omega) * q0 + omega * q1)
+                    }
+                }
+            }
+
+            function calculateDivergence(u, v, div) {
+                const divWidth = div.width;
+                const divHeight = div.height;
+
+                const alpha = 1 / params.dx;
+
+                for (let y = 1; y < divHeight - 1; y++) {
+                    for (let x = 1; x < divWidth - 1; x++) {
+                        const uL = u.get(x, y);
+                        const uR = u.get(x + 1, y);
+                        const vT = v.get(x, y);
+                        const vB = v.get(x, y + 1);
+
+                        div.set(x, y, alpha * (uR - uL + vB - vT));
+                    }
+                }
+            }
+
+            function calculatePressure(div, p) {
+                const pWidth = p.width;
+                const pHeight = p.height;
+
+                const dx = params.dx;
+                const dt = params.dt;
+                const omega = params.omega;
+
+                const alpha = dx * dx / dt;
+
+                for (let y = 1; y < pHeight - 1; y++) {
+                    for (let x = 1; x < pWidth - 1; x++) {
+                        const pL = p.get(x - 1, y);
+                        const pR = p.get(x + 1, y);
+                        const pT = p.get(x, y - 1);
+                        const pB = p.get(x, y + 1);
+
+                        const divC = div.get(x, y);
+
+                        const p0 = p.get(x, y);
+                        const p1 = (pL + pR + pT + pB - alpha * divC) / 4;
+
+                        p.set(x, y, (1 - omega) * p0 + omega * p1);
+                    }
+                }
+            }
+
+            function subtractPressure(p, u, v) {
+                const uWidth = u.width;
+                const uHeight = u.height;
+                const vWidth = v.width;
+                const vHeight = v.height;
+
+                const dx = params.dx;
+                const dt = params.dt;
+
+                // According to the formula, rho should be specified,
+                // but since we used Reynolds number, I guess it could be dropped.
+                // const alpha = dt / (dx * rho);
+                const alpha = dt / dx;
+
+                for (let y = 1; y < uHeight - 1; y++) {
+                    for (let x = 0; x < uWidth - 2; x++) {
+                        const pL = p.get(x, y);
+                        const pR = p.get(x + 1, y);
+
+                        const u0 = u.get(x + 1, y);
+                        const u1 = u0 - alpha * (pR - pL);
+
+                        u.set(x + 1, y, u1);
+                    }
+                }
+
+                for (let y = 0; y < vHeight - 2; y++) {
+                    for (let x = 1; x < vWidth - 1; x++) {
+                        const pT = p.get(x, y);
+                        const pB = p.get(x, y + 1);
+
+                        const v0 = v.get(x, y + 1);
+                        const v1 = v0 - alpha * (pB - pT);
+
+                        v.set(x, y + 1, v1);
+                    }
+                }
+            }
+
+            function calculateVortices(u, v, vor) {
+                const vorWidth = vor.width;
+                const vorHeight = vor.height;
+
+                const alpha = .5 / params.dx;
+
+                for (let y = 1; y < vorHeight - 1; y++) {
+                    for (let x = 1; x < vorWidth - 1; x++) {
+                        const uT = u.get(x, y - 1);
+                        const uB = u.get(x, y + 1);
+                        const vL = v.get(x - 1, y);
+                        const vR = v.get(x + 1, y);
+
+                        vor.set(x, y, alpha * ((vR - vL) - (uB - uT)));
+                    }
+                }
+            }
+
+            function confineVorticity(u, v, vor) {
+                const vorWidth = vor.width;
+                const vorHeight = vor.height;
+
+                const dx = params.dx;
+                const dt = params.dt;
+                const vorticity = params.vorticity;
+
+                const alpha = .5 / dx;
+                const beta = dt * dx * vorticity;
+
+                for (let y = 1; y < vorHeight - 1; y++) {
+                    for (let x = 1; x < vorWidth - 1; x++) {
+                        const vorC = vor.get(x, y);
+                        const vorL = Math.abs(vor.get(x - 1, y));
+                        const vorR = Math.abs(vor.get(x + 1, y));
+                        const vorT = Math.abs(vor.get(x, y - 1));
+                        const vorB = Math.abs(vor.get(x, y + 1));
+
+                        let gradVorX = alpha * (vorR - vorL);
+                        let gradVorY = alpha * (vorB - vorT);
+                        const gradVorLength = Math.max(1e-8, hypot(gradVorX, gradVorY));
+
+                        gradVorX /= gradVorLength;
+                        gradVorY /= gradVorLength;
+
+                        const vorForce = beta * vorC;
+
+                        const u0 = u.get(x, y);
+                        const v0 = v.get(x, y);
+                        const u1 = u0 + vorForce * gradVorY;
+                        const v1 = v0 - vorForce * gradVorX;
+
+                        u.set(x, y, u1);
+                        v.set(x, y, v1);
+                    }
+                }
+            }
+
+            function applyNoSlipsBC(u, v) {
+                const uWidth = u.width;
+                const uHeight = u.height;
+                const vWidth = v.width;
+                const vHeight = v.height;
+
+                for (let x = 0; x < vWidth; x++) {
+                    v.set(x, 1, 0);
+                    v.set(x, vHeight - 2, 0);
+                }
+
+                for (let y = 0; y < uHeight; y++) {
+                    u.set(1, y, 0);
+                    u.set(uWidth - 2, y, 0);
+                }
+            }
+
+            function applyNeumannBC(q) {
+                const qWidth = q.width;
+                const qHeight = q.height;
+
+                for (let x = 0; x < qWidth; x++) {
+                    const qT = q.get(x, 1);
+                    const qB = q.get(x, qHeight - 2);
+
+                    q.set(x, 0, qT);
+                    q.set(x, qHeight - 1, qB);
+                }
+
+                for (let y = 0; y < qHeight; y++) {
+                    const qL = q.get(1, y);
+                    const qR = q.get(qWidth - 2, y);
+
+                    q.set(0, y, qL);
+                    q.set(qWidth - 1, y, qR);
+                }
+            }
+
+            function compute() {
+                const diffusionIterations = params.diffusionIterations;
+                const pressureIterations = params.pressureIterations;
+                const dyeFade = params.dyeFade;
+
+                let temp;
+    
+                advect(u0, v0, u0, u1);
+                advect(u0, v0, v0, v1);
+
+                temp = v0;
+                v0 = v1;
+                v1 = temp;
+
+                temp = u0;
+                u0 = u1;
+                u1 = temp;
+
+                for (let i = 0; i < diffusionIterations; i++) {
+                    diffuse(u0);
+                    diffuse(v0);
+                }
+
+                applyNoSlipsBC(u0, v0);
+
+                calculateDivergence(u0, v0, div);
+
+                p.fill(0);
+
+                for (let i = 0; i < pressureIterations; i++) {
+                    calculatePressure(div, p);
+                }
+
+                applyNeumannBC(p);
+                subtractPressure(p, u0, v0);
+                
+                applyNoSlipsBC(u0, v0);
+
+                calculateVortices(u0, v0, vor);
+                confineVorticity(u0, v0, vor);
+
+                applyNoSlipsBC(u0, v0);
+            
+                advect(u0, v0, dye0, dye1);
+
+                temp = dye0;
+                dye0 = dye1;
+                dye1 = temp;
+
+                for (let i = 0; i < dye0.length; i++) {
+                    dye0[i] *= dyeFade;
+                }
+            }
+
+            function render() {
+                const alpha = params.pressureBlending;
+
+                for (let y = 0; y < canvasHeight; y++) {
+                    for(let x = 0; x < canvasWidth; x++) {
+                        const i = x + y * canvasWidth;
+
+                        const q0 = dye0.get(x, y) - alpha * p.get(x, y);
+                        const q1 = 255 * clamp(q0, 0, 1);
+
+                        const r = q1;
+                        const g = q1;
+                        const b = q1;
+
+                        canvasImageDataView[i] = 255 << 24 | b << 16 | g << 8 | r;
+                    }
+                }
+
+                canvasContext.putImageData(canvasImageData, 0, 0);
+            }
+
+            function loop() {
+                compute();
+                render();
+
+                requestAnimationFrame(loop);
+            }
+        </script>
+    </body>
+</html>
