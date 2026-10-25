@@ -1,0 +1,24 @@
+{
+  "name": "cfd-navier-stokes",
+  "version": "1.0.0",
+  "description": "Simulation based on Navier-Stokes equations for incompressible flow",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build --base=./",
+    "preview": "vite preview"
+  },
+  "author": {
+    "name": "Vlad Matsko",
+    "email": "zzeitfall@gmail.com"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@tweakpane/core": "^2.0.5",
+    "@webgpu/types": "^0.1.74",
+    "vite": "^8.3.5"
+  },
+  "dependencies": {
+    "tweakpane": "^4.0.5"
+  }
+}
